@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets & local artifacts
+.env
+export/
+prompts/
+.pytest_cache/
+
+_shots/
+_shots2/
+
