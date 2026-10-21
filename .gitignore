@@ -12,9 +12,13 @@ wheels/
 # Secrets & local artifacts
 .env
 export/
+out/
 prompts/
 .pytest_cache/
 
 _shots/
 _shots2/
-
+.DS_Store
+.vscode/
+*.pptx
+example/

@@ -1,7 +1,7 @@
 [project]
 name = "ppt-king"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "从资料生成带网格排版的 PPT，并支持 PPTX 与 Markdown 互转"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

@@ -1,4 +1,4 @@
-"""16×9 定位网格语法：在 Markdown 上用 ``@ 列,行 [宽x高] [对齐]`` 指定块位置。
+"""16×9 定位网格语法：用 ``@ 左,上-右,下`` 指定块位置。
 
 坐标从 1 开始，``1,1`` 是左上角。每个格子是正方形（762000 EMU = 0.833 英寸），
 因为 16:9 画布按 16 列 9 行等分时列宽恰好等于行高。
@@ -7,16 +7,17 @@
 
 1. ``# 标题``      —— 演示文稿标题（可省略）
 2. ``## 页标题``   —— 开始新的一页
-3. ``@ 列,行 [宽x高] [left|center|right]`` —— 作用于其后的内容区
+3. ``@ 左,上-右,下 [left|center|right] [字号]`` —— 左上/右下坐标，作用于其后的内容区
 
-**空行不再切块**：一个 ``@`` 到下一个 ``@`` / ``##`` 之间的全部内容属于同一个内容区，
-内部按 Markdown 原样保留段落、列表、小标题的层次。
+旧写法 ``@ 列,行 宽x高`` 仍然兼容。**空行不再切块**：一个 ``@`` 到下一个
+``@`` / ``##`` 之间的全部内容属于同一个内容区，内部按 Markdown 原样保留
+段落、列表、小标题的层次。
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 GRID_COLS = 16
@@ -26,6 +27,12 @@ EMU_PER_CELL = 762000  # 12192000 / 16 == 6858000 / 9
 ANCHOR_RE = re.compile(
     r"^@\s*(\d{1,2})\s*[,，]\s*(\d{1,2})"
     r"(?:\s*(\d{1,2})\s*[x×*]\s*(\d{1,2}))?"
+    r"((?:\s+[^\s]+){0,2})\s*$",
+    re.IGNORECASE,
+)
+ANCHOR_RANGE_RE = re.compile(
+    r"^@\s*(\d{1,2})\s*[,，]\s*(\d{1,2})\s*[-~—–]\s*"
+    r"(\d{1,2})\s*[,，]\s*(\d{1,2})"
     r"((?:\s+[^\s]+){0,2})\s*$",
     re.IGNORECASE,
 )
@@ -50,6 +57,7 @@ IMAGE = "image"
 TABLE = "table"
 QUOTE = "quote"
 CODE = "code"
+FORMULA = "formula"
 
 _ECHO_STRIP_RE = re.compile(r"[\s\W_]+", re.UNICODE)
 _TITLE_INDEX_RE = re.compile(r"^\d+\s*[.、．)）]\s*")
@@ -64,7 +72,8 @@ def _clean_title(title: str) -> str:
 
 def _key(text: str) -> str:
     """用于比较标题与首段是否重复：去掉空白、标点与 Markdown 标记。"""
-    return _ECHO_STRIP_RE.sub("", text.replace("*", "").replace("`", "")).lower()
+    cleaned = re.sub(r"</?red>", "", text, flags=re.IGNORECASE)
+    return _ECHO_STRIP_RE.sub("", cleaned.replace("*", "").replace("`", "")).lower()
 
 
 _FOOTER_RUN_RE = re.compile(r"^[^\n]{0,40}[·•|]\s*[^\n]{0,30}$")
@@ -75,6 +84,9 @@ def _strip_footer(slide: GridSlide) -> None:
     """去掉页脚跑马灯与页码（导出后常残留在正文末尾）。"""
     for block in reversed(slide.blocks):
         if block.kind != TEXT or not block.flow:
+            continue
+        if block.is_positioned:
+            # 显式 @ 坐标是作者有意放置的内容，不做页脚清洗
             continue
         removed = 0
         while block.flow and removed < 2:
@@ -122,6 +134,7 @@ class Box:
     rowspan: int | None = None
     align: str = "left"
     size: float | None = None  # 明确指定的字号（pt）
+    height_emu: int | None = None
 
     def clamped(self) -> "Box":
         col = min(max(1, self.col), GRID_COLS)
@@ -132,7 +145,14 @@ class Box:
         span_y = self.rowspan
         if span_y is not None:
             span_y = min(max(1, span_y), GRID_ROWS - row + 1)
-        return Box(col, row, span, span_y, self.align, self.size)
+        return Box(col, row, span, span_y, self.align, self.size, self.height_emu)
+
+    def with_bottom_limit(self, limit: int) -> "Box":
+        """把框的底边限制在 limit 之上，保留底部安全区。"""
+        if self.y + self.height <= limit:
+            return self
+        height = max(EMU_PER_CELL // 2, limit - self.y)
+        return replace(self, height_emu=height)
 
     @property
     def x(self) -> int:
@@ -148,7 +168,18 @@ class Box:
 
     @property
     def height(self) -> int:
+        if self.height_emu is not None:
+            return self.height_emu
         return (self.rowspan or (GRID_ROWS - self.row + 1)) * EMU_PER_CELL
+
+
+def box_anchor(box: Box) -> str:
+    """把 Box 格式化成 ``@ 左,上-右,下``（右下角含）。"""
+    width = box.colspan or (GRID_COLS - box.col + 1)
+    height = box.rowspan or (GRID_ROWS - box.row + 1)
+    right = min(GRID_COLS, box.col + width - 1)
+    bottom = min(GRID_ROWS, box.row + height - 1)
+    return f"@{box.col},{box.row}-{right},{bottom}"
 
 
 @dataclass
@@ -182,6 +213,8 @@ class GridBlock:
             return f"图片 {self.caption or self.path or ''}"
         if self.kind == CODE:
             return "代码"
+        if self.kind == FORMULA:
+            return f"公式 {self.flow[0].text[:40] if self.flow else ''}"
         return " ".join(item.text for item in self.flow)[:60]
 
 
@@ -291,6 +324,16 @@ def _parse_block(lines: list[str]) -> GridBlock | None:
         body = lines[1:-1] if closed else lines[1:]
         return GridBlock(kind=CODE, flow=[FlowItem("para", "\n".join(body))])
 
+    if first.startswith("$$"):
+        text = "\n".join(lines).strip()
+        if text.startswith("$$"):
+            text = text[2:]
+        if text.endswith("$$"):
+            text = text[:-2]
+        text = " ".join(text.split())
+        if text:
+            return GridBlock(kind=FORMULA, flow=[FlowItem("para", text)])
+
     image = IMAGE_RE.match(first)
     if image:
         caption = image.group("alt").strip()
@@ -364,12 +407,34 @@ def parse_grid(text: str, *, source: Path | None = None) -> GridDeck:
                 deck_title = title
             continue
 
-        anchor = ANCHOR_RE.match(line.strip())
-        if anchor:
+        range_anchor = ANCHOR_RANGE_RE.match(line.strip())
+        size_anchor = ANCHOR_RE.match(line.strip())
+        if range_anchor is not None or size_anchor is not None:
             flush()
+            if range_anchor is not None:
+                left = int(range_anchor.group(1))
+                top = int(range_anchor.group(2))
+                right = int(range_anchor.group(3))
+                bottom = int(range_anchor.group(4))
+                if right < left or bottom < top:
+                    raise GridSyntaxError(
+                        f"坐标范围非法：`{line.strip()}`，右下角必须不小于左上角"
+                    )
+                col = left
+                row = top
+                colspan: int | None = right - left + 1
+                rowspan: int | None = bottom - top + 1
+                extra = range_anchor.group(5)
+            else:
+                assert size_anchor is not None
+                col = int(size_anchor.group(1))
+                row = int(size_anchor.group(2))
+                colspan = int(size_anchor.group(3)) if size_anchor.group(3) else None
+                rowspan = int(size_anchor.group(4)) if size_anchor.group(4) else None
+                extra = size_anchor.group(5)
             align = "left"
             size: float | None = None
-            for token in anchor.group(5).split():
+            for token in extra.split():
                 low = token.lower()
                 low = ALIGN_ALIASES.get(low, low)
                 if low in ("left", "center", "right"):
@@ -379,10 +444,10 @@ def parse_grid(text: str, *, source: Path | None = None) -> GridDeck:
                 if numeric:
                     size = float(numeric.group(1))
             pending = Box(
-                col=int(anchor.group(1)),
-                row=int(anchor.group(2)),
-                colspan=int(anchor.group(3)) if anchor.group(3) else None,
-                rowspan=int(anchor.group(4)) if anchor.group(4) else None,
+                col=col,
+                row=row,
+                colspan=colspan,
+                rowspan=rowspan,
                 align=align,
                 size=size,
             ).clamped()
@@ -418,9 +483,8 @@ def describe(deck: GridDeck) -> str:
         for block in slide.blocks:
             if block.box is not None:
                 box = block.box
-                span = f" {box.colspan}x{box.rowspan}" if (box.colspan or box.rowspan) else ""
                 align = "" if box.align == "left" else f" {box.align}"
-                where = f"@{box.col},{box.row}{span}{align}"
+                where = f"{box_anchor(box)}{align}"
             else:
                 where = "auto"
             extra = ""

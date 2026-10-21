@@ -1,24 +1,21 @@
-"""ppt-king：PPTX <-> Markdown 双向转换（格式映射由大模型完成）。"""
+"""ppt-king：从资料生成 PPT，并在 PPTX 与 Markdown 之间转换。"""
 
 from __future__ import annotations
 
 from .exporter import ExportResult, export_pptx
+from .generate import GenerateResult, generate_deck
 from .reader import read_pptx
-from .rebuild import RebuildResult, rebuild_from_export, rebuild_from_spec
-from .spec import DeckSpec
 
 __all__ = [
-    "DeckSpec",
     "ExportResult",
-    "RebuildResult",
+    "GenerateResult",
     "export_pptx",
+    "generate_deck",
     "read_pptx",
-    "rebuild_from_export",
-    "rebuild_from_spec",
     "main",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def main() -> None:
