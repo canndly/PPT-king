@@ -5,10 +5,14 @@ description = "从资料生成带网格排版的 PPT，并支持 PPTX 与 Markdo
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "mammoth>=1.8",
     "openai>=3.35.1",
+    "openpyxl>=3.1",
+    "pypdf>=6.0",
     "python-dotenv>=1.2.4",
     "python-pptx>=1.0.2",
     "tenacity>=9.2.1",
+    "xlrd>=2.0",
 ]
 
 [project.scripts]
@@ -22,3 +26,6 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

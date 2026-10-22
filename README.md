@@ -1,29 +1,61 @@
 # ppt-king
 
-从资料文件夹生成 PPT：**AI 写带坐标的 Markdown，渲染器确定性地出片**。
+把「资料文件夹」交给 AI，直接得到一份可编辑的 PPTX。
+
+你只需要：
+
+1. clone 项目，把资料放进 [`资料/`](资料)
+2. 用 Claude Code / Cursor / Codex 等 Agent 打开项目
+3. 对它说：**“阅读项目，根据资料文件夹中的内容给我生成 ppt”**
+4. Agent 会带你完成依赖安装与 `.env` 配置，然后开始生成
+5. 成品在 `out/资料/资料.pptx`
+
+> 项目内置 [`AGENTS.md`](AGENTS.md)，Agent 会自动按「自检 → 配 Key → 生成 → 汇报」的顺序执行。
+
+## 推荐用法：让 Agent 代跑
+
+把资料放进 `资料/` 后，在项目根目录对 Agent 说：
+
+```text
+阅读项目，根据“资料文件夹”中的内容给我生成 ppt。
+```
+
+Agent 会：
+
+- 阅读 [`README.md`](README.md) 和 [`AGENTS.md`](AGENTS.md)
+- 运行 `uv run ppt-king doctor` 检查环境
+- 缺 `.env` 时执行 `cp .env.example .env`，并提示你填入 `PPT_KING_API_KEY`
+- Key 就绪后运行 `uv run ppt-king generate`
+- 把 PPTX 路径、页数和失败页告诉你
+
+## 手动用法（3 条命令）
+
+```bash
+uv sync
+cp .env.example .env    # 编辑 .env，填入 PPT_KING_API_KEY
+uv run ppt-king generate
+# 默认读取 资料/，输出 out/资料/资料.pptx
+```
+
+先自检也可以：
+
+```bash
+uv run ppt-king doctor
+```
+
+它会确认 `.env`、API Key、资料目录、页面模板和默认 Logo 是否就绪。
+
+## 命令一览
 
 - `generate`：资料目录 → 大纲 → 逐页网格 Markdown → PPTX（一次跑完）。
+- `doctor`：检查环境是否就绪，首次 clone 后先跑它。
 - `render`：16×9 网格 Markdown → PPTX，纯本地，不调用模型。
 - `layout`：给普通 Markdown 补网格坐标，再交给 `render`。
 - `parse`：PPTX → Markdown + 图片，供重排或二次生成。
 
-## 安装
-
-```bash
-uv sync
-cp .env.example .env   # generate / layout / parse 需要 Key
-```
-
-也可以每次用 `--api-key` 传入，不写 `.env`。
-
 ## 从资料生成 PPT
 
-### 最小用法
-
-```bash
-uv run ppt-king generate ./资料 --api-key sk-xxx
-# 默认输出：out/资料/资料.pptx
-```
+资料目录、支持格式与参数如下。
 
 资料目录约定：
 
@@ -31,10 +63,28 @@ uv run ppt-king generate ./资料 --api-key sk-xxx
 资料/
 ├── outline.md        # 可选，也可以叫 大纲.md
 ├── 项目说明.md
-├── 实验数据.txt
-└── 架构图.png
+├── 论文.pdf
+├── 实验数据.xlsx
+├── 架构图.png
+└── 附件/
+    └── 答辩记录.docx
 ```
 
+支持的资料格式（参考 markitdown 的转换器设计，统一转成 Markdown）：
+
+| 类别 | 格式 |
+| --- | --- |
+| 文本 | `.md` `.markdown` `.txt` `.text` `.log` `.rst` `.org` `.tex` `.srt` `.vtt` |
+| 代码/配置 | `.py` `.js` `.ts` `.java` `.c` `.cpp` `.go` `.rs` `.sql` `.sh` `.json` `.xml` `.yaml` `.toml` `.ini` 等 |
+| 表格 | `.csv` `.tsv` `.xlsx` `.xls` |
+| 文档 | `.pdf` `.docx` `.pptx` `.epub` `.rtf` `.eml` `.ipynb` |
+| 网页 | `.html` `.htm` `.xhtml` |
+| 压缩包 | `.zip`（递归转换其中的资料，最多两层） |
+| 图片 | `.png` `.jpg` `.jpeg` `.gif` `.bmp` `.webp` `.svg` `.tif` `.tiff` |
+
+- PDF、DOCX、PPTX、XLSX 里的正文、表格和图片会被抽取；图片写入 `assets/`，逐页写作时可直接引用。
+- 扫描版 PDF 没有文字层，仍需要 OCR，本项目只提示而不内置 OCR。
+- 旧版二进制 `.doc` / `.ppt` 不支持，请先另存为 `.docx` / `.pptx`。
 - 受众、汇报场景、语气等要求直接写进 `outline.md`，不再通过命令行参数指定。
 - 大纲优先使用 `--outline` 指定的文件。
 - 没有指定时，只在资料目录根目录查找 `outline.md`、`大纲.md`、`outline.txt`、`大纲.txt`。
@@ -68,7 +118,8 @@ uv run ppt-king generate ./资料 \
   --outline ./资料/大纲.md \
   --out ./out/我的汇报 \
   --slides 12-18 \
-  --accent 2E5C8A
+  --accent 2E5C8A \
+  --prompt-file ./static/prompt.md
 ```
 
 | 参数 | 说明 |
@@ -81,6 +132,7 @@ uv run ppt-king generate ./资料 \
 | `--logo PATH` | 覆盖默认 Logo（默认 `static/page_logo.png`，固定左上角 8×1） |
 | `--no-logo` | 不显示默认 Logo |
 | `--header TEXT` | 可选全局页眉；页面里也可以用 `@ 9,1-16,1` 单独填写右上角槽位 |
+| `--prompt-file PATH` | 页面风格/排版偏好文件，默认 `static/prompt.md` |
 | `--resume` | 复用已有大纲和逐页结果 |
 | `--force` | 忽略已有中间产物，全部重做 |
 | `--strict` | 任意一页失败即整体失败 |
@@ -114,7 +166,8 @@ out/<资料目录名>/
 
 ```text
 资料目录
-  │ sources.scan_sources：读取 md/txt，复制图片，发现/校验大纲
+  │ documents.convert_document：PDF/DOCX/PPTX/XLSX/HTML… → Markdown + 图片
+  │ sources.scan_sources：扫描资料、落盘图片、发现/校验大纲
   ▼
 SourceBundle
   │ outline.generate_outline：逐份摘要 → 归纳大纲（或直接解析人工大纲）
@@ -140,6 +193,21 @@ slides.grid.md
 - **图片白名单**：模型只能引用程序复制到 `assets/` 的图片，编造路径会被拒绝。
 - **表格优先**：同类指标达到 3 项时优先输出表格；同一张表跨页重复会被自动去重。
 - **渲染确定性**：坐标、字号、主题、表格样式都由本地代码计算，模型不直接画图。
+- **页面偏好外置**：页面风格、强调色占比、文字/图片排布偏好从 `static/prompt.md` 读取；修改文件后缓存自动失效。
+- **模板推荐**：逐页写作前会先调用一次模型，从 `static/templates/` 推荐 1–3 个参考模板；随后把模板内容和本页内容一起交给写作模型。模板只提供版式参考，坐标硬约束优先。
+
+## 页面偏好（static/prompt.md）
+
+默认读取 [`static/prompt.md`](static/prompt.md)，也可以给 `generate` 传
+`--prompt-file 其他文件.md`。文件内容会追加到逐页写作提示词中，适合放：
+
+- 页面风格：学术简洁、白底黑字、无装饰等。
+- 着重色占比：红色强调最多几处、占正文多少比例。
+- 排版偏好：纯文字整宽、文字+图片左右分栏、并列要点左右两栏等。
+- 图片与表格习惯：是否加边框、表格何时使用、图片使用范围。
+
+偏好与程序的坐标/重叠/图片白名单等硬约束冲突时，以硬约束为准。
+文件内容会进入页级缓存键，改完文件直接重跑即可生效，不需要手动清缓存。
 
 ## 16×9 网格语法
 
@@ -202,6 +270,44 @@ $$ m·v·ω ≤ μmg  ⇒  v·ω ≤ μg $$
 | 只有 ≥3 张图 | 两列网格 |
 | 只有表格 | 整宽表格 |
 | 文字 + 表格/多图 | 文字在上，其余依次向下 |
+
+## 模板编写模式
+
+```bash
+uv run ppt-king -t
+# 等价于
+uv run ppt-king --template-adjust
+```
+
+程序会扫描 `static/templates/` 下的 Markdown 模板，列出后让用户选择。
+选择后不会自动打开文件；请用你自己的编辑器修改并保存，终端预览会自动刷新。
+建议终端至少 `80×24`（约 16:10），推荐 `96×27`（16:9）；尺寸或比例不足时
+预览状态栏会持续提醒。
+
+预览按键：
+
+| 按键 | 作用 |
+| --- | --- |
+| `←` / `→` | 上一页 / 下一页 |
+| `r` | 手动刷新 |
+| `q` / `Esc` | 退出 |
+
+模板格式与普通 16×9 网格 Markdown 相同。当前内置模板包括标题页、章节页、
+3 点文字、4 点 2×2、编号要点、双栏要点、左右图文、双图对照、表格数据、
+公式说明和总结页。
+
+## 从模板 PPTX 反推模板
+
+```bash
+uv run ppt-king template-import static/template.pptx -o out/templates-import --force
+```
+
+按形状包围盒近似映射回 16×9 网格，每页生成一个 `.md`，图片导出到
+`assets/`。默认输出目录是 `out/templates-import`，不加 `--force` 时不会覆盖
+已有模板文件。该过程是确定性的，不调用模型。
+
+生成时每页会先从模板库推荐参考模板；调试时加 `--debug-dump DIR` 可以查看
+每页实际推荐了哪些模板，以及最终发给模型的完整请求。
 
 ## 直接渲染
 
@@ -276,12 +382,11 @@ export/<ppt 名>/
 
 ## 当前范围与限制
 
-- 资料格式：第一版支持 `.md` / `.markdown` / `.txt` 与常见图片（png/jpg/jpeg/gif/bmp/webp/svg）。
-- PDF、DOCX、PPTX 资料暂不内置解析；可通过 `sources.register_extractor()` 扩展。
-- 扫描版 PDF 即使后续支持抽取，也需要 OCR，本项目不提供。
-- 不生成图片，只使用资料目录中已有的图片。
-- 不支持旧版 `.ppt`、SmartArt、动画与渲染预览。
-- 输出目录不能与资料目录相同，避免覆盖原始资料。
+- 资料格式：见上方“支持的资料格式”；PDF/DOCX/PPTX/XLSX 的解析依赖已随 `uv sync` 安装。
+- 旧版二进制 `.doc` / `.ppt` 不支持；扫描版 PDF 需要 OCR，本项目不提供。
+- 图片只来自资料目录或文档内嵌图片，不调用模型生成图片。
+- 不支持 SmartArt、动画与渲染预览；输出目录不能与资料目录相同。
+- 需要自定义格式时，仍可用 `sources.register_extractor(suffix, reader)` 注册纯文本抽取器。
 
 ## 开发
 
@@ -291,7 +396,7 @@ uv run pytest
 
 模块划分：
 
-- 生成方向：`sources`（资料摄入）、`outline`（大纲）、`writing`（逐页写作）、`generate`（编排）。
+- 生成方向：`documents`（多格式转 Markdown/抽图）、`sources`（资料摄入）、`outline`（大纲）、`writing`（逐页写作）、`generate`（编排）。
 - 网格方向：`grid`（语法解析）、`grid_render`（确定性渲染）、`grid_ai`（模型补坐标）。
 - 解析方向：`reader`（pptx→IR）、`serialize`/`prompt`（IR→载荷/提示词）、`markdown`（清洗、校验、占位符替换）、`exporter`（编排）。
 - 公共：`config`、`llm`、`cache`、`assets`、`cli`。

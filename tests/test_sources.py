@@ -39,7 +39,7 @@ def test_scan_sources_reads_text_and_copies_images(tmp_path: Path) -> None:
     assert image.rel.startswith("assets/src01_")
     assert image.caption == "架构图"
     assert image.path.is_file()
-    assert "unsupported.pdf" in bundle.skipped
+    assert any(item.startswith("unsupported.pdf") for item in bundle.skipped)
     assert "unsupported.pdf" in describe_skipped(bundle)
 
 

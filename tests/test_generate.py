@@ -52,6 +52,8 @@ def _fake_complete(calls: list[str]):
         calls.append(system)
         if "资料分析员" in system:
             return "- 输入 24V，输出 5V"
+        if "PPT 版式推荐器" in system:
+            return '{"templates":[]}'
         if "大纲策划" in system:
             return (
                 "# 自动标题\n\n## 封面\n\n- 副标题\n\n"
@@ -59,10 +61,10 @@ def _fake_complete(calls: list[str]):
             )
         if "PPT 内容撰写器" in system:
             if "可用图片：无" in user:
-                return "@ 1,3 16x6\n输入电压为 24V。"
+                return "@ 2,3-15,8\n输入电压为 24V。"
             return (
-                "@ 1,3 8x6\n输入电压为 24V。\n\n"
-                "@ 10,3 7x5\n![内容架构图](assets/src01_pic.png)"
+                "@ 2,3-8,7\n输入电压为 24V。\n\n"
+                "@ 10,3-15,7\n![内容架构图](assets/src01_pic.png)"
             )
         raise AssertionError(f"未知提示词：{system[:40]}")
 
@@ -93,7 +95,7 @@ def test_generate_end_to_end(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     assert (out / "pages" / "p02.md").is_file()
     assert (out / "assets" / "src01_pic.png").is_file()
     assert not result.failures
-    assert len(calls) == 2  # 显式大纲，只写两页
+    assert len(calls) == 4  # 两页：每页推荐模板 + 写作
 
     deck = load_grid(result.grid_path)
     assert len(deck.slides) == 2
@@ -140,7 +142,7 @@ def test_generate_force_rewrites_pages(
         use_cache=False,
     )
 
-    assert len(calls) == 2
+    assert len(calls) == 4
 
 
 def test_generate_ai_outline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -161,7 +163,7 @@ def test_generate_ai_outline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
 
     assert (out / "outline.md").is_file()
     assert result.pages == 3
-    assert len(calls) == 5  # 摘要 + 大纲 + 三页
+    assert len(calls) == 8  # 摘要 + 大纲 + 三页 ×（推荐 + 写作）
 
 
 def test_generate_adds_cover_when_ai_outline_omits_it(
@@ -172,7 +174,7 @@ def test_generate_adds_cover_when_ai_outline_omits_it(
             return "- 摘要"
         if "大纲策划" in system:
             return "# 自动标题\n\n## 背景\n\n- 要点\n\n## 总结\n\n- 结论"
-        return "@ 1,3 16x6\n正文内容"
+        return "@ 2,3-15,8\n正文内容"
 
     monkeypatch.setattr(LLMClient, "complete", fake_complete)
     source = _source(tmp_path, with_outline=False)
@@ -200,7 +202,7 @@ def test_generate_continues_after_page_failure(
     def fake_complete(self, system: str, user: str) -> str:
         if "页标题：内容" in user:
             raise LLMError("模拟单页失败")
-        return "@ 1,3 16x6\n封面内容"
+        return "@ 2,3-15,8\n封面内容"
 
     monkeypatch.setattr(LLMClient, "complete", fake_complete)
     source = _source(tmp_path)

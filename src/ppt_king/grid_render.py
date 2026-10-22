@@ -806,7 +806,7 @@ def _auto_placement(
 
 
 def _widen_lone_text(slide: GridSlide) -> None:
-    """整页只有一个正文文字块时铺满 16 列，避免无意义的左半栏留白。"""
+    """整页只有一个正文文字块时铺满内容区，左右各留 1 列。"""
     content = [
         block
         for block in slide.blocks
@@ -816,11 +816,11 @@ def _widen_lone_text(slide: GridSlide) -> None:
         return
     block = content[0]
     box = block.box
-    if block.kind != TEXT or box is None or box.col != 1:
+    if block.kind != TEXT or box is None:
         return
     width = box.colspan or (GRID_COLS - box.col + 1)
-    if width < GRID_COLS:
-        block.box = replace(box, colspan=GRID_COLS)
+    if box.col != 2 or width != GRID_COLS - 2:
+        block.box = replace(box, col=2, colspan=GRID_COLS - 2)
 
 
 def _render_slide(

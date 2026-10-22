@@ -25,12 +25,15 @@ from .outline import (
     validate_outline,
 )
 from .sources import SourceBundle, describe_skipped, read_text_file, scan_sources
+from .templates import TemplateInfo, load_templates
 from .writing import (
+    DEFAULT_PROMPT_FILE,
     PageResult,
     WritingError,
     assemble_deck,
     dedupe_duplicate_images,
     dedupe_duplicate_tables,
+    load_style_prompt,
     placeholder_chunk,
     split_chunks,
     write_page,
@@ -144,6 +147,8 @@ def _run_page(
     cache: Cache,
     language: str,
     logo: bool,
+    style_prompt: str,
+    templates: list[TemplateInfo],
     dump_dir: Path | None,
     use_cache: bool,
     resume: bool,
@@ -170,6 +175,8 @@ def _run_page(
             cache=cache,
             language=language,
             logo=logo,
+            style_prompt=style_prompt,
+            templates=templates,
             dump_dir=dump_dir,
             use_cache=use_cache,
         )
@@ -221,6 +228,7 @@ def generate_deck(
     accent: str | None = None,
     logo: str | Path | bool | None = None,
     header: str | None = None,
+    prompt_file: str | Path | None = None,
     concurrency: int | None = None,
     use_cache: bool = True,
     dump_dir: str | Path | None = None,
@@ -237,6 +245,20 @@ def generate_deck(
     settings = settings or load_settings()
     if concurrency:
         settings = replace(settings, concurrency=concurrency)
+
+    try:
+        style_prompt = load_style_prompt(prompt_file)
+    except OSError as exc:
+        raise GenerateError(f"读取页面偏好失败：{exc}") from exc
+    if progress and style_prompt:
+        print(
+            f"[ppt-king] 页面偏好：{prompt_file or DEFAULT_PROMPT_FILE}",
+            file=sys.stderr,
+        )
+
+    templates = load_templates()
+    if progress:
+        print(f"[ppt-king] 可用模板：{len(templates)} 个", file=sys.stderr)
 
     # 默认 Logo（None）同样要占用标题上方的页眉区，逐页写作必须从第 3 行开始。
     use_logo = logo is not False
@@ -298,6 +320,8 @@ def generate_deck(
                 cache=cache,
                 language=language,
                 logo=use_logo,
+                style_prompt=style_prompt,
+                templates=templates,
                 dump_dir=dump_path,
                 use_cache=use_cache,
                 resume=resume,

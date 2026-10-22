@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,19 +12,23 @@ from .cache import Cache
 from .config import Settings
 from .grid import (
     CODE,
+    FORMULA,
     GRID_COLS,
     GRID_ROWS,
     IMAGE,
     TABLE,
+    TEXT,
     GridSyntaxError,
     box_anchor,
     parse_grid,
 )
-from .llm import LLMClient
+from .llm import LLMClient, LLMError
 from .outline import Outline, OutlinePage
 from .sources import SourceBundle, SourceImage
+from .templates import TemplateInfo, catalog_text
 
-PROMPT_VERSION = "write-v2"
+PROMPT_VERSION = "write-v13"
+DEFAULT_PROMPT_FILE = Path(__file__).resolve().parents[2] / "static" / "prompt.md"
 MAX_EVIDENCE_CHARS = 7_000
 MAX_EVIDENCE_PER_DOC = 5
 MAX_IMAGES = 6
@@ -100,20 +106,25 @@ SYSTEM_PROMPT = """你是 PPT 内容撰写器。输入是一页幻灯片的大�
 也可留空；不要在这里放正文或图片。
 
 ## 布局选择
-1. 纯文字：`@ 1,2-16,8`
-2. 文字 + 一张图：文字 `@ 1,2-8,8`，图片 `@ 10,3-16,7`
-3. 文字 + 两张图：文字 `@ 1,2-7,8`，图片 `@ 9,2-16,5` 与 `@ 9,6-16,8`
-4. 只有一张图：`@ 2,2-15,8`
-5. 只有表格：`@ 1,2-16,8`
-6. 文字 + 表格：文字 `@ 1,2-16,4`，表格 `@ 1,6-16,8`
-7. 封面：主标题 `@ 1,4-16,4 center 34`，副标题/汇报人 `@ 1,6-16,6 center 18`；不要用列表，不要重复“封面”二字
-8. 章节页：编号 `@ 1,3-16,4 center 60`，标题 `@ 1,5-16,5 center 28`
+1. 纯文字：`@ 2,3-15,8`
+2. 文字 + 一张图：文字 `@ 2,3-8,8`，图片 `@ 10,3-15,7`
+3. 文字 + 两张图：文字 `@ 2,3-7,8`，图片 `@ 9,3-15,4` 与 `@ 9,6-15,8`
+4. 只有一张图：`@ 2,3-15,8`
+5. 只有表格：`@ 2,3-15,8`
+6. 文字 + 表格：文字 `@ 2,3-15,4`，表格 `@ 2,6-15,8`
+7. 封面：主标题 `@ 2,4-15,4 center 34`，副标题/汇报人 `@ 2,6-15,6 center 18`；不要用列表，不要重复“封面”二字
+8. 章节页：编号 `@ 2,3-15,4 center 60`，标题 `@ 2,6-15,6 center 28`
+9. 只有恰好 4 个同权重并列要点、且本页没有公式/图片/表格时，才每条单独成块并 2×2 定位 `@ 2,3-7,4`、`@ 10,3-15,4`、`@ 2,6-7,7`、`@ 10,6-15,7`；其他情况不要用 2×2
+10. 结论/局限：左右两栏纯文字，`@ 2,3-7,8` 与 `@ 10,3-15,8`，每栏 2 条；不要加背景卡片或装饰
+11. 含公式页面：说明文字（可包含结论）`@ 2,3-15,5`，公式 `@ 2,7-15,7 center 24`；固定 2 块纵向排列，不要单独放 1 行结论，不要 2×2
+12. 总结页：只用 1 个整宽文字块 `@ 2,3-15,8`，不要拆成多块，不要 2×2
+13. 数据/结果页：表格 `@ 2,3-15,5`，结论 `@ 2,7-15,8`；结论至少 2 行，禁止只占第 8 行
 
 ## 表格优先
 当资料证据里有多组同构指标（如电压、电流、效率、纹波、功率）或参数对比时，
 优先输出 GFM 表格，不要逐条写成列表：
 ```
-@ 1,2-16,6
+@ 2,3-15,6
 | 指标 | 数值 | 单位 |
 | --- | --- | --- |
 | 输入电压 | 24 | V |
@@ -125,23 +136,141 @@ SYSTEM_PROMPT = """你是 PPT 内容撰写器。输入是一页幻灯片的大�
 ## 硬约束
 1. 只使用资料证据中的事实、数字、单位和结论，不编造。
 2. 完整覆盖本页要点；每页 1-3 个块，内容少时不要硬凑。
-3. 坐标必须在 1..16 列、1..9 行内，块之间不重叠，横竖至少留 1 格。
-4. 文字块高度按内容给足：每 2 行文字约 1 格，宁可给大不要给小；若本页只有文字、没有图片或表格，文字块必须占满 16 列。
+3. 坐标必须在 1..16 列、1..9 行内；内容块左右各留 1 列（只放在第 2..15 列），块之间横竖至少留 1 格。只有恰好 4 个同权重要点且没有公式/图片/表格时，才用 2×2；不要把它当默认版式。
+4. 文字块高度按内容给足：每 2 行文字约 1 格，宁可给大不要给小；超过 30 字的文字块至少给 2 行，且不要把它单独放在第 8 行。若本页只有文字、没有图片或表格，文字块使用 `@ 2,3-15,8`。
 5. 图片块至少 5 格宽、4 格高，路径必须原样来自可用图片清单。
 6. 表格高度 = `ceil((行数+1) / 2)` 格，至少 3 格。
 7. 内容过多时不要缩小字号，用 `<!-- split -->` 单独一行分页。
 8. 同类指标达到 3 项时，用表格呈现，而不是列表；但同一张表不要跨页重复。
-9. 公式必须单独成块：`@ 1,5-16,5 center 24` 后接 `$$ ... $$`，前后各放一段文字。
-10. 封面、章节页、总结页不要放表格，除非本页要点明确要求数据对比。
-11. 正文、表格、图片的底边不要超过第 8 行底部，第 9 行留空作为安全边距。
-12. 本页要点涉及架构、结构、流程或示意，且可用图片清单中有与主题直接相关的图片时，必须使用一张；图片题注必须与图片实际内容一致，不要为了配图而歪曲图片含义。
-13. 只输出 Markdown 块与 `@` 行。"""
+9. 公式必须单独成块：`@ 2,7-15,7 center 24` 后接 `$$ ... $$`；含公式页面固定 2 块，说明（含结论）在上、公式在下，禁止 2×2，也不要单独放 1 行结论。
+10. 标题含“总结”的页面只输出 1 个整宽文字块 `@ 2,3-15,8`，不要拆分，不要 2×2。
+11. 封面、章节页、总结页不要放表格，除非本页要点明确要求数据对比。
+12. 正文、表格、图片的底边不要超过第 8 行底部，第 9 行留空作为安全边距。
+13. 本页要点涉及架构、结构、流程或示意，且可用图片清单中有与主题直接相关的图片时，必须使用一张；图片题注必须与图片实际内容一致，不要为了配图而歪曲图片含义。
+14. 图片题注只能写在图片块内；不要单独输出没有对应图片的题注或说明文字。
+15. 只输出 Markdown 块与 `@` 行。"""
+
+
+def load_style_prompt(path: str | Path | None = None) -> str:
+    """读取用户可编辑的页面偏好；默认文件不存在时返回空字符串。"""
+    target = Path(path).expanduser() if path else DEFAULT_PROMPT_FILE
+    if not target.is_file():
+        if path:
+            raise FileNotFoundError(f"找不到页面偏好文件：{target}")
+        return ""
+    return target.read_text(encoding="utf-8-sig").strip()
+
+
+def build_system_prompt(style_prompt: str = "") -> str:
+    """把用户页面偏好追加到逐页写作系统提示词。"""
+    extra = style_prompt.strip()
+    if not extra:
+        return SYSTEM_PROMPT
+    return (
+        f"{SYSTEM_PROMPT}\n\n## 用户页面偏好\n"
+        "以下偏好用于调整页面风格与排版；如与上述硬约束冲突，以硬约束为准。\n\n"
+        f"{extra}"
+    )
+
+RECOMMEND_SYSTEM_PROMPT = """你是 PPT 版式推荐器。根据本页标题、要点和资料证据，从给定模板中挑选 1-3 个最适合参考的模板。
+
+只输出 JSON，不要解释：
+{"templates":["模板文件名.md"]}
+
+规则：
+- 只能使用给定模板中的文件名。
+- 文字为主选文字模板；有图表/表格/公式/图片时选对应结构。
+- 标题页、章节页、总结页优先选对应专用模板。
+- 没有合适模板时输出 {"templates":[]}，不要硬选。"""
+
+
+def _parse_template_names(raw: str, templates: list[TemplateInfo]) -> list[TemplateInfo]:
+    text = raw.strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if match is None:
+        return []
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, dict):
+        values = data.get("templates", [])
+    elif isinstance(data, list):
+        values = data
+    else:
+        return []
+    if not isinstance(values, list):
+        return []
+    allowed = {template.name: template for template in templates}
+    selected: list[TemplateInfo] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        name = Path(value).name
+        template = allowed.get(name)
+        if template is not None and template not in selected:
+            selected.append(template)
+    return selected[:3]
+
+
+def recommend_templates(
+    page: OutlinePage,
+    outline: Outline,
+    evidence: str,
+    templates: list[TemplateInfo],
+    *,
+    settings: Settings,
+    client: LLMClient,
+    cache: Cache,
+    use_cache: bool = True,
+) -> list[TemplateInfo]:
+    """让模型从模板库中挑选本页可参考的模板。"""
+    if not templates:
+        return []
+    catalog = catalog_text(templates)
+    payload = (
+        f"演示文稿：{outline.title}\n"
+        f"页标题：{page.title or '(无)'}\n"
+        "本页要点：\n"
+        + "\n".join(f"- {point}" for point in page.points)
+        + "\n\n资料证据：\n"
+        + (evidence[:3000] or "（无）")
+        + "\n\n可用模板：\n"
+        + catalog
+    )
+    signature = hashlib.sha1(catalog.encode("utf-8")).hexdigest()
+    key = Cache.key(
+        "template-recommend",
+        PROMPT_VERSION,
+        settings.model,
+        f"{settings.temperature}",
+        signature,
+        page.title,
+        "\n".join(page.points),
+        evidence[:3000],
+    )
+    raw = cache.get(key) if use_cache else None
+    if raw is None:
+        try:
+            raw = client.complete(RECOMMEND_SYSTEM_PROMPT, payload)
+        except LLMError:
+            return []
+        if use_cache:
+            cache.put(key, raw)
+    return _parse_template_names(raw, templates)
+
 
 CORRECTION_TEMPLATE = """你上一次的输出无法使用：{error}
 
 请重新输出这一页。要求：
 - 每行 `@ 左,上-右,下` 之后紧跟一个块
-- 坐标在 1..16 / 1..9 范围内，块之间不重叠
+- 内容块左右各留 1 列（第 2..15 列），块之间横竖至少留 1 格
+- 超过 30 字的文字块至少给 2 行高
+- 结果页结论使用 `@ 2,7-15,8`，不要用 `@ 2,8-15,8`
+- 含公式页面固定 2 块：说明（含结论）在上、公式在下，禁止 2×2
+- 总结页只用一个整宽文字块，不要拆成多块
+- 只有恰好 4 个同权重要点且没有公式/图片/表格时，才用 2×2
 - 图片只能使用清单里的路径，不能写别的路径
 - 不要输出页标题、代码围栏或解释"""
 
@@ -296,9 +425,14 @@ def _normalize_image_path(value: str) -> str:
 
 
 def _box_rect(box) -> tuple[int, int, int, int]:
+    """返回 (左, 上, 右后一列, 下后一行)，后两项为开区间。"""
     width = box.colspan or (GRID_COLS - box.col + 1)
     height = box.rowspan or (GRID_ROWS - box.row + 1)
     return box.col, box.row, box.col + width, box.row + height
+
+
+def _is_header_box(box) -> bool:
+    return box.row == 1 and box.col >= 9 and (box.colspan or 1) <= 8
 
 
 def validate_page(
@@ -333,12 +467,80 @@ def validate_page(
             box = block.box
             if box is None:
                 continue
-            header = box.row == 1 and box.col >= 9 and (box.colspan or 1) <= 8
-            if box.row < 3 and not header:
+            if box.row < 3 and not _is_header_box(box):
                 raise WritingError(
                     f"第 {page_number} 页正文与页眉/标题重叠："
                     f"`{box_anchor(box)}` 应移到第 3 行及以后"
                 )
+
+    for block in blocks:
+        box = block.box
+        if box is None or _is_header_box(box):
+            continue
+        left, _, right_exclusive, _ = _box_rect(box)
+        if left < 2 or right_exclusive > GRID_COLS:
+            raise WritingError(
+                f"第 {page_number} 页块与页面左右边缘至少留 1 格："
+                f"`{box_anchor(box)}` 请放在第 2..15 列"
+            )
+
+    content_blocks = [
+        block
+        for block in blocks
+        if not (block.box and _is_header_box(block.box))
+    ]
+    is_summary = "总结" in title
+    if is_summary and (
+        len(content_blocks) != 1 or content_blocks[0].kind != TEXT
+    ):
+        raise WritingError(
+            f"第 {page_number} 页是总结页，请只输出 1 个整宽文字块 `@ 2,3-15,8`"
+        )
+
+    if any(block.kind == FORMULA for block in content_blocks):
+        if len(content_blocks) > 2:
+            raise WritingError(
+                f"第 {page_number} 页含公式，最多保留 2 个块："
+                "说明（含结论）在上、公式在下，纵向排列，不要 2×2"
+            )
+        text_blocks = [block for block in content_blocks if block.kind == TEXT]
+        for index, block in enumerate(text_blocks):
+            if block.box is None:
+                continue
+            ax1, ay1, ax2, ay2 = _box_rect(block.box)
+            for other in text_blocks[index + 1 :]:
+                if other.box is None:
+                    continue
+                bx1, by1, bx2, by2 = _box_rect(other.box)
+                same_rows = min(ay2, by2) > max(ay1, by1)
+                side_by_side = ax2 < bx1 or bx2 < ax1
+                if same_rows and side_by_side:
+                    raise WritingError(
+                        f"第 {page_number} 页含公式，不要左右分栏；"
+                        "请按“说明 → 公式 → 结论”纵向排列"
+                    )
+
+    for block in blocks:
+        if block.kind != TEXT or block.box is None:
+            continue
+        rows = block.box.rowspan or (GRID_ROWS - block.box.row + 1)
+        chars = sum(len(item.text) for item in block.flow)
+        if rows < 2 and chars > 30 and not is_cover:
+            raise WritingError(
+                f"第 {page_number} 页文字块高度不足：`{box_anchor(block.box)}` "
+                "超过 30 字至少需要 2 行"
+            )
+        bullets = [
+            item
+            for item in block.flow
+            if item.kind == "bullet" and item.level == 0
+        ]
+        if len(bullets) >= 4 and not is_summary:
+            raise WritingError(
+                f"第 {page_number} 页有 {len(bullets)} 条并列要点却堆在一个块里；"
+                "请拆成多个独立文字块，4 条优先 2×2："
+                "@ 2,3-7,4、@ 10,3-15,4、@ 2,6-7,7、@ 10,6-15,7"
+            )
 
     for index, block in enumerate(blocks):
         if block.box is None:
@@ -353,6 +555,14 @@ def validate_page(
                     f"第 {page_number} 页块重叠："
                     f"`{box_anchor(block.box)}` 与 "
                     f"`{box_anchor(other.box)}`，请重新分配坐标"
+                )
+            horizontal_gap = ax2 < bx1 or bx2 < ax1
+            vertical_gap = ay2 < by1 or by2 < ay1
+            if not (horizontal_gap or vertical_gap):
+                raise WritingError(
+                    f"第 {page_number} 页块之间至少留 1 格："
+                    f"`{box_anchor(block.box)}` 与 "
+                    f"`{box_anchor(other.box)}`"
                 )
 
     for block in blocks:
@@ -379,13 +589,15 @@ def build_page_payload(
     *,
     language: str = "zh",
     logo: bool = False,
+    templates: list[TemplateInfo] | None = None,
 ) -> str:
     layout_note = (
         "版式：Logo 占左上角 8×1 格，右上角 8×1 是页眉槽位（可用 "
         "`@ 9,1-16,1 right 20` 写短文本），页面标题在第 2 行，正文从第 3 行开始，"
-        "内容底边不超过第 8 行。"
+        "内容块左右各留 1 列（第 2..15 列），块间至少留 1 格，内容底边不超过第 8 行。"
         if logo
-        else "版式：页面标题在第 1 行，正文从第 2 行开始，内容底边不超过第 8 行。"
+        else "版式：页面标题在第 1 行，正文从第 2 行开始，"
+        "内容块左右各留 1 列（第 2..15 列），块间至少留 1 格，内容底边不超过第 8 行。"
     )
     lines = [
         f"演示文稿：{outline.title}",
@@ -393,9 +605,25 @@ def build_page_payload(
         f"页标题：{page.title or '(无)'}",
         f"语言：{language}",
         layout_note,
-        "",
-        "本页要点：",
     ]
+    if templates:
+        lines.extend(
+            [
+                "",
+                "参考模板（只参考版式和块结构；必须替换为当前内容，"
+                "与上方硬约束冲突时以硬约束为准）：",
+            ]
+        )
+        for template in templates:
+            lines.extend(
+                [
+                    f"### {template.name}",
+                    "```markdown",
+                    template.content,
+                    "```",
+                ]
+            )
+    lines.extend(["", "本页要点："])
     lines.extend(f"- {point}" for point in page.points)
     if not page.points:
         lines.append("- 根据页标题撰写简洁内容")
@@ -432,13 +660,26 @@ def write_page(
     cache: Cache,
     language: str = "zh",
     logo: bool = False,
+    style_prompt: str = "",
+    templates: list[TemplateInfo] | None = None,
     dump_dir: Path | None = None,
     use_cache: bool = True,
 ) -> PageResult:
     """生成一页；失败时抛 :class:`WritingError`。"""
+    system = build_system_prompt(style_prompt)
     evidence = select_evidence(bundle, page)
     images = select_images(bundle, page)
     allowed_images = {image.rel for image in images}
+    selected_templates = recommend_templates(
+        page,
+        outline,
+        evidence,
+        templates or [],
+        settings=settings,
+        client=client,
+        cache=cache,
+        use_cache=use_cache,
+    )
     payload = build_page_payload(
         page,
         outline,
@@ -447,6 +688,7 @@ def write_page(
         images,
         language=language,
         logo=logo,
+        templates=selected_templates,
     )
 
     key = Cache.key(
@@ -454,6 +696,7 @@ def write_page(
         PROMPT_VERSION,
         settings.model,
         f"{settings.temperature}",
+        style_prompt,
         payload,
     )
     cached = cache.get(key) if use_cache else None
@@ -465,7 +708,7 @@ def write_page(
             number=page.number, title=page.title, chunks=chunks, from_cache=True
         )
 
-    raw = client.complete(SYSTEM_PROMPT, payload)
+    raw = client.complete(system, payload)
     body = clean_output(raw)
     try:
         chunks = split_chunks(body)
@@ -477,7 +720,7 @@ def write_page(
             raise WritingError(f"第 {page.number} 页输出为空")
     except WritingError as exc:
         correction = CORRECTION_TEMPLATE.format(error=exc)
-        raw = client.complete(SYSTEM_PROMPT, f"{payload}\n\n{correction}")
+        raw = client.complete(system, f"{payload}\n\n{correction}")
         body = clean_output(raw)
         chunks = split_chunks(body)
         try:
@@ -488,6 +731,7 @@ def write_page(
             if not chunks:
                 raise WritingError(f"第 {page.number} 页输出为空")
         except WritingError as retry_exc:
+            _dump(dump_dir, page.number, payload, body)
             raise WritingError(
                 f"第 {page.number} 页「{page.title}」重试后仍不合规：{retry_exc}"
             ) from retry_exc
@@ -501,14 +745,14 @@ def placeholder_chunk(page: OutlinePage, *, logo: bool = False) -> str:
     if page.number == 1:
         subtitle = page.points[0] if page.points else "自动生成"
         return (
-            f"@ 1,4-16,4 center 34\n{page.title}\n\n"
-            f"@ 1,6-16,6 center 18\n{subtitle}"
+            f"@ 2,4-15,4 center 34\n{page.title}\n\n"
+            f"@ 2,6-15,6 center 18\n{subtitle}"
         )
     points = page.points or ["内容待补充"]
     start_row = 3 if logo else 2
     height = 6 if logo else 7
     bottom = start_row + height - 1
-    return f"@ 1,{start_row}-16,{bottom}\n" + "\n".join(
+    return f"@ 2,{start_row}-15,{bottom}\n" + "\n".join(
         f"- {point}" for point in points
     )
 

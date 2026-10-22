@@ -228,7 +228,7 @@ def test_render_widens_lone_text_block(tmp_path: Path) -> None:
         for shape in prs.slides[0].shapes
         if shape.has_text_frame and "正文内容" in shape.text_frame.text
     )
-    assert body.width == SLIDE_W
+    assert body.width == SLIDE_W - 2 * EMU_PER_CELL
 
 
 def test_render_creates_slides(tmp_path: Path) -> None:

@@ -9,14 +9,18 @@ from ppt_king.config import Settings
 from ppt_king.llm import LLMClient
 from ppt_king.outline import Outline, OutlinePage, parse_outline
 from ppt_king.sources import SourceBundle, SourceImage, scan_sources
+from ppt_king.templates import TemplateInfo
 from ppt_king.writing import (
     PageResult,
     WritingError,
     assemble_deck,
     build_page_payload,
+    build_system_prompt,
     clean_output,
     dedupe_duplicate_images,
     dedupe_duplicate_tables,
+    load_style_prompt,
+    recommend_templates,
     select_evidence,
     select_images,
     split_chunks,
@@ -87,11 +91,11 @@ def test_validate_page_requires_coordinates() -> None:
 
 def test_validate_page_rejects_unknown_image() -> None:
     with pytest.raises(WritingError):
-        validate_page(1, "页", "@ 1,2 8x4\n![图](assets/evil.png)", set())
+        validate_page(1, "页", "@ 2,3-8,5\n![图](assets/evil.png)", set())
 
 
 def test_validate_page_accepts_known_image() -> None:
-    validate_page(1, "页", "@ 1,2 8x4\n![图](assets/a.png)", {"assets/a.png"})
+    validate_page(1, "页", "@ 2,3-8,5\n![图](assets/a.png)", {"assets/a.png"})
 
 
 def test_validate_page_with_logo_rejects_title_overlap() -> None:
@@ -103,7 +107,7 @@ def test_validate_page_with_logo_allows_header_and_body() -> None:
     validate_page(
         2,
         "正文",
-        "@ 9,1 8x1 right 20\n页眉\n\n@ 1,3 16x5\n正文",
+        "@ 9,1 8x1 right 20\n页眉\n\n@ 2,3-15,5\n正文",
         set(),
         logo=True,
     )
@@ -114,16 +118,158 @@ def test_validate_page_rejects_overlapping_blocks() -> None:
         validate_page(
             2,
             "正文",
-            "@ 1,3 8x4\n左\n\n@ 5,3 8x4\n右",
+            "@ 2,3-10,6\n左\n\n@ 6,3-14,6\n右",
             set(),
             logo=True,
         )
 
 
+def test_validate_page_summary_rejects_multiple_blocks() -> None:
+    with pytest.raises(WritingError, match="总结页"):
+        validate_page(
+            2,
+            "总结",
+            "@ 2,3-7,4\n一\n\n@ 10,3-15,4\n二",
+            set(),
+            logo=True,
+        )
+
+
+def test_validate_page_summary_accepts_single_full_width_block() -> None:
+    validate_page(
+        2,
+        "总结",
+        "@ 2,3-15,8\n- 一\n- 二\n- 三\n- 四",
+        set(),
+        logo=True,
+    )
+
+
+def test_validate_page_rejects_two_by_two_on_formula_page() -> None:
+    with pytest.raises(WritingError, match="公式"):
+        validate_page(
+            2,
+            "公式",
+            "@ 2,3-7,4\n教师\n\n@ 10,3-15,4\n学生\n\n"
+            "@ 2,6-7,7 center 24\n$$ z $$\n\n@ 10,6-15,7\n结论",
+            set(),
+            logo=True,
+        )
+
+
+def test_validate_page_accepts_two_block_formula_layout() -> None:
+    validate_page(
+        2,
+        "公式",
+        "@ 2,3-15,5\n说明与结论\n\n@ 2,7-15,7 center 24\n$$ z $$",
+        set(),
+        logo=True,
+    )
+
+
+def test_validate_page_rejects_long_text_in_one_row() -> None:
+    with pytest.raises(WritingError, match="至少需要 2 行"):
+        validate_page(
+            2,
+            "正文",
+            "@ 2,8-15,8\n这是一段超过三十个字的正文，用来检查文字块高度是否足够容纳内容。",
+            set(),
+            logo=True,
+        )
+
+
+def test_validate_page_rejects_four_bullets_in_one_block() -> None:
+    with pytest.raises(WritingError, match="2×2"):
+        validate_page(
+            2,
+            "正文",
+            "@ 2,3-15,8\n- 一\n- 二\n- 三\n- 四\n",
+            set(),
+            logo=True,
+        )
+
+
+def test_validate_page_accepts_four_bullets_split_into_cards() -> None:
+    validate_page(
+        2,
+        "正文",
+        "@ 2,3-7,5\n- 一\n- 二\n\n@ 10,3-15,5\n- 三\n- 四\n",
+        set(),
+        logo=True,
+    )
+
+
+def test_recommend_templates_parses_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    templates = [
+        TemplateInfo(
+            name="文字页.md",
+            path=tmp_path / "文字页.md",
+            content="@ 2,3-15,8\n示例文字",
+        ),
+        TemplateInfo(
+            name="表格页.md",
+            path=tmp_path / "表格页.md",
+            content="@ 2,3-15,4\n说明\n\n@ 2,6-15,8\n| A | B |",
+        ),
+    ]
+
+    def fake_complete(self, system: str, user: str) -> str:
+        assert "PPT 版式推荐器" in system
+        return '```json\n{"templates":["表格页.md","不存在.md"]}\n```'
+
+    monkeypatch.setattr(LLMClient, "complete", fake_complete)
+    settings = _settings(tmp_path)
+    page = OutlinePage(number=1, title="数据", points=["指标 A"])
+    outline = Outline(title="演示", pages=[page])
+
+    selected = recommend_templates(
+        page,
+        outline,
+        "指标 A 为 24V",
+        templates,
+        settings=settings,
+        client=LLMClient(settings),
+        cache=Cache.create(tmp_path / "cache", enabled=False),
+        use_cache=False,
+    )
+
+    assert [template.name for template in selected] == ["表格页.md"]
+
+
+def test_build_page_payload_embeds_selected_templates() -> None:
+    page = OutlinePage(number=2, title="数据", points=["指标 A"])
+    outline = Outline(title="演示", pages=[page])
+    template = TemplateInfo(
+        name="表格页.md",
+        path=Path("表格页.md"),
+        content="@ 2,3-15,4\n说明\n\n@ 2,6-15,8\n| A | B |",
+    )
+
+    payload = build_page_payload(
+        page, outline, 2, "证据", [], logo=True, templates=[template]
+    )
+
+    assert "参考模板" in payload
+    assert "表格页.md" in payload
+    assert "| A | B |" in payload
+
+
+def test_load_style_prompt_and_build_system_prompt(tmp_path: Path) -> None:
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("# 页面偏好\n\n- 红色只用于结论\n", encoding="utf-8")
+    style = load_style_prompt(prompt_path)
+    assert "红色只用于结论" in style
+    system = build_system_prompt(style)
+    assert "用户页面偏好" in system
+    assert "红色只用于结论" in system
+
+
 def test_write_page(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     def fake_complete(self, system: str, user: str) -> str:
         assert "PPT 内容撰写器" in system
-        return "@ 1,2 16x8\n输入电压为 24V。"
+        return "@ 2,2-15,8\n输入电压为 24V。"
 
     monkeypatch.setattr(LLMClient, "complete", fake_complete)
     settings = _settings(tmp_path)
@@ -141,7 +287,36 @@ def test_write_page(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     )
 
     assert result.ok
-    assert result.chunks == ["@ 1,2 16x8\n输入电压为 24V。"]
+    assert result.chunks == ["@ 2,2-15,8\n输入电压为 24V。"]
+
+
+def test_write_page_injects_style_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_complete(self, system: str, user: str) -> str:
+        captured["system"] = system
+        return "@ 2,2-15,8\n输入电压为 24V。"
+
+    monkeypatch.setattr(LLMClient, "complete", fake_complete)
+    settings = _settings(tmp_path)
+    outline, bundle = parse_outline("# 演示\n\n## 输入\n\n- 24V\n"), _bundle(tmp_path)
+
+    write_page(
+        outline.pages[0],
+        outline,
+        1,
+        bundle,
+        settings=settings,
+        client=LLMClient(settings),
+        cache=Cache.create(tmp_path / "cache", enabled=False),
+        style_prompt="页面风格：简洁，红色只用于结论。",
+        use_cache=False,
+    )
+
+    assert "用户页面偏好" in captured["system"]
+    assert "红色只用于结论" in captured["system"]
 
 
 def test_write_page_rejects_unknown_image_after_retry(
@@ -150,7 +325,7 @@ def test_write_page_rejects_unknown_image_after_retry(
     monkeypatch.setattr(
         LLMClient,
         "complete",
-        lambda self, system, user: "@ 10,3 7x5\n![图](assets/evil.png)",
+        lambda self, system, user: "@ 9,3-15,7\n![图](assets/evil.png)",
     )
     settings = _settings(tmp_path)
     outline, bundle = parse_outline("# 演示\n\n## 图\n\n- 架构\n"), _bundle(tmp_path)

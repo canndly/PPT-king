@@ -1,7 +1,7 @@
-"""资料摄入：扫描资料目录，读取 Markdown/TXT，收集图片，发现大纲。
+"""资料摄入：扫描资料目录，读取多种格式资料，收集图片，发现大纲。
 
-第一版只支持 ``.md`` / ``.markdown`` / ``.txt`` 与常见图片格式。
-PDF、DOCX、PPTX 通过 :func:`register_extractor` 预留扩展入口，暂不内置解析器。
+格式转换由 :mod:`ppt_king.documents` 负责，支持 txt/md/code/CSV/HTML/PDF/
+DOCX/PPTX/XLSX/EPUB/ZIP/Notebook 等；文档内嵌图片会落盘到 ``assets/``。
 """
 
 from __future__ import annotations
@@ -14,18 +14,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-TEXT_SUFFIXES = {".md", ".markdown", ".txt"}
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg"}
+from .documents import (
+    IMAGE_SUFFIXES,
+    PLAIN_TEXT_SUFFIXES,
+    SUPPORTED_SUFFIXES,
+    ConversionError,
+    convert_document,
+    read_text_file,
+)
+
+TEXT_SUFFIXES = set(SUPPORTED_SUFFIXES)
 OUTLINE_NAMES = ("outline.md", "大纲.md", "outline.txt", "大纲.txt")
 IGNORED_DIRS = {".git", ".svn", ".hg", "__pycache__", "node_modules", ".venv", "venv"}
 
-MAX_TEXT_BYTES = 2_000_000
 MAX_IMAGES = 200
 MAX_SKIPPED_LISTED = 20
 
 _TITLE_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 _MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 _SAFE_NAME_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff_-]+")
+_PLACEHOLDER_RE = re.compile(r"!\[([^\]]*)\]\(pptking-image://([^)\s]+)\)")
 
 
 class SourceError(ValueError):
@@ -69,29 +77,12 @@ class SourceBundle:
 # --------------------------------------------------------------------------
 # 格式注册
 # --------------------------------------------------------------------------
-def read_text_file(path: Path) -> str:
-    """按 UTF-8 / GB18030 依次尝试读取文本。"""
-    raw = path.read_bytes()[:MAX_TEXT_BYTES]
-    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
-
-
-_read_plain_text = read_text_file
-
-
-_EXTRACTORS: dict[str, Callable[[Path], str]] = {
-    ".md": _read_plain_text,
-    ".markdown": _read_plain_text,
-    ".txt": _read_plain_text,
-}
+# 外部可以注册自定义抽取器；内置格式由 documents.convert_document 处理。
+_EXTRACTORS: dict[str, Callable[[Path], str]] = {}
 
 
 def register_extractor(suffix: str, reader: Callable[[Path], str]) -> None:
-    """注册新的文本抽取器，供后续支持 PDF/DOCX/PPTX。"""
+    """注册额外的纯文本抽取器；同名后缀会覆盖内置转换。"""
     key = suffix.lower()
     if not key.startswith("."):
         key = "." + key
@@ -156,7 +147,7 @@ def discover_outline(
             path = Path.cwd() / path
         if not path.is_file():
             raise SourceError(f"找不到大纲文件：{explicit}")
-        if path.suffix.lower() not in TEXT_SUFFIXES:
+        if path.suffix.lower() not in PLAIN_TEXT_SUFFIXES:
             raise SourceError(f"大纲文件必须是纯文本：{path}")
         return path.resolve()
 
@@ -185,7 +176,7 @@ def _image_captions(root: Path, exclude: set[Path] | None = None) -> dict[Path, 
         if exclude and _excluded(path, exclude):
             continue
         try:
-            text = _read_plain_text(path)
+            text = read_text_file(path)
         except OSError:
             continue
         for match in _MD_IMAGE_RE.finditer(text):
@@ -202,39 +193,78 @@ def _safe_stem(stem: str) -> str:
     return cleaned[:40] or "image"
 
 
-def _copy_images(
-    paths: list[Path], out_dir: Path, captions: dict[Path, str]
-) -> list[SourceImage]:
-    if not paths:
-        return []
-    assets = out_dir / "assets"
-    assets.mkdir(parents=True, exist_ok=True)
+class _ImageSink:
+    """把散落在资料中的图片统一写入 ``assets/`` 并按内容去重。"""
 
-    seen: dict[str, SourceImage] = {}
-    images: list[SourceImage] = []
-    for path in paths[:MAX_IMAGES]:
+    def __init__(self, out_dir: Path) -> None:
+        self.assets = out_dir / "assets"
+        self.assets.mkdir(parents=True, exist_ok=True)
+        self.images: list[SourceImage] = []
+        self._seen: dict[str, SourceImage] = {}
+
+    def _next_name(self, stem: str, suffix: str) -> str:
+        return f"src{len(self.images) + 1:02d}_{_safe_stem(stem)}{suffix}"
+
+    def add_bytes(
+        self,
+        data: bytes | None,
+        suffix: str,
+        *,
+        stem: str = "image",
+        title: str = "",
+        caption: str = "",
+    ) -> str | None:
+        """写入图片并返回相对输出目录的路径；重复图片直接复用。"""
+        if not data or len(self.images) >= MAX_IMAGES:
+            return None
+        digest = hashlib.sha1(data).hexdigest()
+        if digest in self._seen:
+            return self._seen[digest].rel
+        suffix = (suffix or ".png").lower()
+        if not suffix.startswith("."):
+            suffix = "." + suffix
+        filename = self._next_name(stem or title or "image", suffix)
+        target = self.assets / filename
         try:
-            digest = hashlib.sha1(path.read_bytes()).hexdigest()
+            target.write_bytes(data)
         except OSError:
-            continue
-        if digest in seen:
-            continue
+            return None
+        image = SourceImage(
+            rel=f"assets/{filename}",
+            path=target,
+            title=title or stem,
+            caption=caption,
+        )
+        self._seen[digest] = image
+        self.images.append(image)
+        return image.rel
+
+    def add_file(self, path: Path, caption: str = "") -> str | None:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+        digest = hashlib.sha1(data).hexdigest()
+        if digest in self._seen:
+            return self._seen[digest].rel
+        if len(self.images) >= MAX_IMAGES:
+            return None
         suffix = path.suffix.lower() or ".png"
-        filename = f"src{len(images) + 1:02d}_{_safe_stem(path.stem)}{suffix}"
-        target = assets / filename
+        filename = self._next_name(path.stem, suffix)
+        target = self.assets / filename
         try:
             shutil.copyfile(path, target)
         except OSError:
-            continue
+            return None
         image = SourceImage(
             rel=f"assets/{filename}",
             path=target,
             title=path.stem,
-            caption=captions.get(path.resolve(), ""),
+            caption=caption,
         )
-        seen[digest] = image
-        images.append(image)
-    return images
+        self._seen[digest] = image
+        self.images.append(image)
+        return image.rel
 
 
 def scan_sources(
@@ -259,10 +289,17 @@ def scan_sources(
     docs: list[SourceDoc] = []
     image_paths: list[Path] = []
     skipped: list[str] = []
+    sink = _ImageSink(target_dir)
+    doc_index = 0
+
+    def note_skip(message: str) -> None:
+        if len(skipped) < MAX_SKIPPED_LISTED:
+            skipped.append(message)
 
     outline_names = {name.lower() for name in OUTLINE_NAMES}
     for path in _iter_files(source, excludes):
         suffix = path.suffix.lower()
+        rel = path.relative_to(source).as_posix()
         if path.name.lower() in outline_names:
             continue
         if outline_resolved and path.resolve() == outline_resolved:
@@ -271,23 +308,50 @@ def scan_sources(
             image_paths.append(path)
             continue
         reader = _EXTRACTORS.get(suffix)
-        if reader is None:
-            if len(skipped) < MAX_SKIPPED_LISTED:
-                skipped.append(path.relative_to(source).as_posix())
-            continue
-        try:
-            text = reader(path).strip()
-        except OSError as exc:
-            skipped.append(f"{path.name}（读取失败：{exc}）")
+        if reader is not None:
+            try:
+                text = reader(path).strip()
+            except OSError as exc:
+                note_skip(f"{rel}（读取失败：{exc}）")
+                continue
+            converted_images = []
+        elif suffix in TEXT_SUFFIXES:
+            doc_index += 1
+            try:
+                converted = convert_document(path, key_prefix=f"s{doc_index:03d}_")
+            except ConversionError as exc:
+                note_skip(f"{rel}（{exc}）")
+                continue
+            except OSError as exc:
+                note_skip(f"{rel}（读取失败：{exc}）")
+                continue
+            text = converted.markdown.strip()
+            converted_images = converted.images
+        else:
+            note_skip(rel)
             continue
         if not text:
             continue
         match = _TITLE_RE.search(text)
         title = match.group(1).strip() if match else path.stem
+
+        if converted_images:
+            mapping: dict[str, str] = {}
+            for image in converted_images:
+                stored = sink.add_bytes(
+                    image.data,
+                    image.suffix,
+                    stem=f"{path.stem}_{image.key}",
+                    title=image.title or path.stem,
+                    caption=image.alt,
+                )
+                if stored:
+                    mapping[image.key] = stored
+            text = _rewrite_placeholders(text, mapping)
         docs.append(
             SourceDoc(
                 path=path,
-                rel=path.relative_to(source).as_posix(),
+                rel=rel,
                 title=title,
                 text=text,
             )
@@ -295,20 +359,35 @@ def scan_sources(
 
     if not docs:
         raise SourceError(
-            f"{source} 中没有可读取的 .md/.txt 资料（当前支持："
-            + "、".join(sorted(TEXT_SUFFIXES))
-            + "）"
+            f"{source} 中没有可读取的资料（支持 md/txt/csv/html/pdf/docx/pptx/"
+            "xlsx/epub/zip 等，详见 README“支持的资料格式”）"
         )
 
-    images = _copy_images(image_paths, target_dir, _image_captions(source, excludes))
+    captions = _image_captions(source, excludes)
+    for path in image_paths:
+        sink.add_file(path, captions.get(path.resolve(), ""))
+
     return SourceBundle(
         root=source,
         out_dir=target_dir,
         docs=docs,
-        images=images,
+        images=sink.images,
         outline=outline_resolved,
         skipped=skipped,
     )
+
+
+def _rewrite_placeholders(text: str, mapping: dict[str, str]) -> str:
+    """把转换层生成的内部图片占位符换成实际 ``assets/`` 路径。"""
+
+    def replace(match: re.Match[str]) -> str:
+        alt, key = match.group(1), match.group(2)
+        rel = mapping.get(key)
+        if rel:
+            return f"![{alt}]({rel})"
+        return alt or ""
+
+    return _PLACEHOLDER_RE.sub(replace, text)
 
 
 def describe_skipped(bundle: SourceBundle) -> str:

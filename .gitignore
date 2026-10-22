@@ -16,9 +16,14 @@ out/
 prompts/
 .pytest_cache/
 
+# User materials: keep the folder, never commit its contents
+资料/*
+!资料/.gitkeep
+
 _shots/
 _shots2/
-.DS_Store
 .vscode/
 *.pptx
 example/
+refer/
+.DS_Store

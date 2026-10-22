@@ -22,12 +22,23 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="ppt-king",
         description="从资料生成 PPT，或在 PPTX 与 Markdown 之间转换。",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "-t",
+        "--template-adjust",
+        action="store_true",
+        help="模板编写模式：选择 static/templates 下的模板并实时预览",
+    )
+    sub = parser.add_subparsers(dest="command", required=False)
 
     generate = sub.add_parser(
         "generate", help="资料目录 -> 大纲 -> 逐页网格 Markdown -> PPTX"
     )
-    generate.add_argument("source", help="资料目录（.md/.txt/图片）")
+    generate.add_argument(
+        "source",
+        nargs="?",
+        default="资料",
+        help="资料目录（默认 资料/；PDF/Word/PPT/Excel/HTML 等均可）",
+    )
     generate.add_argument("--outline", help="显式指定大纲文件；默认自动查找 outline.md/大纲.md")
     generate.add_argument("-o", "--out", help="输出目录（默认 out/<资料目录名>）")
     generate.add_argument(
@@ -38,6 +49,10 @@ def _build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--logo", help="覆盖默认 Logo（默认 static/page_logo.png）")
     generate.add_argument("--no-logo", action="store_true", help="不显示默认 Logo")
     generate.add_argument("--header", help="右上角 8×1 区域的页眉文字")
+    generate.add_argument(
+        "--prompt-file",
+        help="页面风格/排版偏好 Markdown（默认 static/prompt.md）",
+    )
     generate.add_argument("--resume", action="store_true", help="复用已有大纲和逐页结果")
     generate.add_argument("--force", action="store_true", help="忽略已有中间产物，全部重做")
     generate.add_argument("--strict", action="store_true", help="任意一页失败即整体失败")
@@ -78,6 +93,21 @@ def _build_parser() -> argparse.ArgumentParser:
     render.add_argument("--no-logo", action="store_true", help="不显示默认 Logo")
     render.add_argument("--header", help="右上角 8×1 区域的页眉文字")
     render.add_argument("--check", action="store_true", help="只打印解析结果，不渲染")
+
+    template_import = sub.add_parser(
+        "template-import", help="从 PPTX 近似反推模板 Markdown + 图片"
+    )
+    template_import.add_argument("pptx", help=".pptx 文件")
+    template_import.add_argument(
+        "-o", "--out", default="out/templates-import", help="输出目录（默认 out/templates-import）"
+    )
+    template_import.add_argument("--force", action="store_true", help="覆盖同名模板文件")
+
+    doctor = sub.add_parser(
+        "doctor", help="检查 .env、资料目录、模板和依赖是否就绪"
+    )
+    doctor.add_argument("--source", default="资料", help="资料目录（默认 资料/）")
+    doctor.add_argument("--env-file", help="指定 .env 路径")
 
     layout = sub.add_parser(
         "layout", help="让模型给普通 Markdown 加上 16×9 网格坐标"
@@ -137,14 +167,27 @@ def _overrides(args: argparse.Namespace) -> dict[str, object]:
 
 def main(argv: list[str] | None = None) -> int:
     _force_utf8()
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
 
+    if getattr(args, "template_adjust", False):
+        from .template_adjust import run_template_adjust
+
+        return run_template_adjust()
+
+    if not args.command:
+        parser.print_help()
+        return 2
     if args.command == "generate":
         return _run_generate(args)
+    if args.command == "doctor":
+        return _run_doctor(args)
     if args.command == "parse":
         return _run_parse(args)
     if args.command == "render":
         return _run_render(args)
+    if args.command == "template-import":
+        return _run_template_import(args)
     if args.command == "layout":
         return _run_layout(args)
     return 1
@@ -167,6 +210,7 @@ def _run_generate(args: argparse.Namespace) -> int:
             accent=args.accent,
             logo=False if args.no_logo else args.logo,
             header=args.header,
+            prompt_file=args.prompt_file,
             use_cache=not args.no_cache,
             dump_dir=args.debug_dump,
             strict=args.strict,
@@ -191,6 +235,68 @@ def _run_generate(args: argparse.Namespace) -> int:
         for failure in result.failures:
             print(f"  - {failure}", file=sys.stderr)
         return 1
+    return 0
+
+
+def _run_doctor(args: argparse.Namespace) -> int:
+    """面向首次 clone 的自检：确认 API、资料目录和模板都就绪。"""
+    import platform
+
+    from .documents import supported_suffixes
+    from .grid_render import DEFAULT_LOGO
+    from .templates import load_templates
+
+    print("[ppt-king] 环境自检")
+    print(f"  Python      {platform.python_version()}")
+
+    try:
+        settings = load_settings(args.env_file, require_api_key=False)
+    except ConfigurationError as exc:
+        print(f"  配置        {exc}")
+        return 2
+
+    env_file = Path(settings.env_file) if settings.env_file else None
+    issues: list[str] = []
+    if env_file and env_file.is_file():
+        print(f"  配置文件    {env_file}")
+    else:
+        print("  配置文件    未找到 .env")
+        issues.append("复制配置模板：cp .env.example .env")
+    if settings.api_key:
+        print("  API Key     已配置")
+    else:
+        print("  API Key     未配置")
+        issues.append("在 .env 中填写 PPT_KING_API_KEY")
+    print(f"  模型        {settings.model} @ {settings.base_url}")
+
+    source = Path(args.source)
+    if source.is_dir():
+        suffixes = set(supported_suffixes())
+        count = sum(
+            1
+            for path in source.rglob("*")
+            if path.is_file()
+            and not path.name.startswith(".")
+            and path.suffix.lower() in suffixes
+        )
+        print(f"  资料目录    {source.resolve()}")
+        print(f"  可用资料    {count} 个文件")
+        if count == 0:
+            issues.append(f"把资料放进 {source}/（PDF/Word/PPT/Excel/图片等）")
+    else:
+        print(f"  资料目录    不存在：{source}")
+        issues.append(f"创建资料目录并放入资料：mkdir -p {source}")
+
+    templates = load_templates()
+    print(f"  页面模板    {len(templates)} 个")
+    print(f"  默认 Logo   {'有' if Path(DEFAULT_LOGO).is_file() else '缺失'}")
+
+    if issues:
+        print("\n[需要处理]")
+        for issue in issues:
+            print(f"  - {issue}")
+        return 1
+    print("\n[可以开始] 运行：uv run ppt-king generate")
     return 0
 
 
@@ -278,6 +384,20 @@ def _run_render(args: argparse.Namespace) -> int:
         print(f"[ppt-king] 图片不存在：{item}（已用占位文字代替）", file=sys.stderr)
     for item in report.overflows[:10]:
         print(f"[ppt-king] 溢出警告：{item}", file=sys.stderr)
+    return 0
+
+
+def _run_template_import(args: argparse.Namespace) -> int:
+    from .template_import import TemplateImportError, write_templates
+
+    try:
+        results = write_templates(args.pptx, args.out, force=args.force)
+    except (TemplateImportError, OSError) as exc:
+        print(f"[ppt-king] 模板提取失败：{exc}", file=sys.stderr)
+        return 1
+    print(f"[ppt-king] 生成 {len(results)} 个模板 -> {Path(args.out)}")
+    for item in results:
+        print(f"  - {item.path}")
     return 0
 
 
